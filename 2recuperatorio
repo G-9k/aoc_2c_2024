@@ -1,0 +1,340 @@
+# Ejercicio 1
+
+a)
+
+Para implementar ambas syscall debo primero definir sus entradas en la IDT.
+
+```c
+void idt_init() {
+    //...
+    IDT_ENTRY3(99);
+    IDT_ENTRY3(100);
+    //...
+}
+```
+
+Como las ùnicas tareas que pueden ser definidas en nuestro sistema son tareas de usuario las entradas en la IDT son de nivel 3. La interrupciòn 99 es swap y la 100 es swap_now.
+
+La tarea llama a la syscall con un parametro, por lo que el parametro se guarda en la pila, en el handler de la interrupciòn primero hago el pushad, para guardar los valores actuales de los registros de proposito general, luego debo hacer un pop del argumento que me pasaron, el cual està bastante arriba. Sabiendo como pushea el pushad.
+```
+%define offset_EAX 28
+%define offset_ECX 24
+%define offset_EDX 20
+%define offset_EBX 16
+%define offset_ESP 12
+%define offset_EBP 8
+%define offset_ESI 4
+%define offset_EDI 0
+```
+Veo que mi valor estarìa en el offset 32.
+
+Algo que necesito saber es quien pide swap a que tarea, para hacer eso puedo crear en sched.c un array de arrays de booleanos, basicamente una matriz de booleanos.
+
+```c
+bool matrizSwap[MAX_TASKS][MAX_TASKS];
+```
+
+Con esto puedo tener algo como "matrizSwap[1][2] == True" lo que interpretarìa como que la tarea con ID 1 pidio cambio con la tarea con ID 2, lo que luego podria hacer para verificar si puedo hacer el cambio es ver si se cumple "matrizSwap[2][1] == True", si eso ocurre, ambas tareas pidieron cambiar, entonces las cambio. 
+
+En el caso de que el swap no se concrete, quiere decir que estoy en la tarea origen que quiere swapear con la de destino, entonces pido al scheduler que me de una tarea nueva (el cual serà distinta de la origen) y hago un jmp far a esa (ya que no puedo retornar a la tarea actual)
+
+Ahora, si al fijarme que en la matriz ambas tareas pidieron swap, entonces el swap se puede concretar, por lo que intercambio todos los registros.
+
+Se que cuando ocurre un intercambio de registros es porque estoy en un swap, la otra tarea evidentmente pasò por un jmp far, por lo que los registros generales que debo cambiar estan en la tss de la otra tarea y los valores de los registros que debo cambiar estàn en la pila debido al pushad (ya que al hacer un popad si no reemplazo los de ahì se pisarìan todos.)
+
+```asm
+section .data
+task_offtset: dd 0x00000000
+task_selector: dw 0x0000
+
+global _isr99
+_isr99:              
+    pushad
+    mov word bx, [esp + 32]      ; este es el id al que quiero swapear.
+    call obtenerIDTask           ; con eso obtengo el ID de la tarea actual
+    push bx
+    push ax
+    call swap                    ; chequeo en la matriz si puedo swapear
+    add esp, 4
+
+    cmp ax, 1                    ; swap me dice si puedo swapear, si puedo es 1
+    jl noSwap                    ; si es menor a 1, no puedo, no swapea.
+
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    call sched_enable_task       ; si la otra tarea pidiò un swapeo con swap
+                                 ; normal, està deshabilitada, ahora la habilito
+                                 ; usando el id porque el cambio se realizarà
+                                 
+    call regsGeneralesTSS        ; con el id consigo todos los registros generales
+                                 ; los cuales me los retorna en un array siendo eax 
+                                 ; la direcciòn inicial de la matriz.
+    add esp, 2
+
+    mov dword edi, [esp]                ; resguardo el valor original de edi de la tarea actual
+    mov dword [esp], [eax]              ; reemplazo el valor de edi de la actual, con el de la otra tarea
+    mov dword [eax], edi                ; a medida que voy reemplazando valores, guardo los actuales en el array
+
+    mov dword esi, [esp + 4]            ; guardo esi
+    mov dword [esp + 4], [eax + 4]
+    mov dword [eax + 4], esi
+
+    mov dword ebx, [esp + 16]           ; guardo ebx
+    mov dword [esp + 16], [eax + 8]
+    mov dword [eax + 8], ebx
+
+    mov dword edx, [esp + 20]           ; guardo edx
+    mov dword [esp + 20], [eax + 12]
+    mov dword [eax + 12], edx
+
+    mov dword ecx, [esp + 24]           ; guardo ecx
+    mov dword [esp + 24], [eax + 16]
+    mov dword [eax + 16], ecx
+
+    mov dword ecx, [esp + 28]           ; guardo eax, acà igual uso como registro intermediario ecx
+    mov dword [esp + 28], [eax + 20]    ; porque si uso eax, pierdo el puntero al array
+    mov dword [eax + 20], ecx
+
+    ; para este punto ya hice todos los cambios en la tarea actual
+    ; y el array que empieza en eax tiene todos los valores actuales,
+    ; se lo puedo mandar a una funciòn en C para que use esos valores
+    ; para cambiarlo en la tss.
+
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    push eax                     ; pusheo el id de la tarea destino y el array con los valores.
+
+    call cambiarEnTSS
+
+    add esp, 6
+
+    ; ya completè todos los cambios, sigue la ejecuciòn de la tarea actual
+
+    jmp fin
+
+
+noSwap: 
+    call obtenerIDTask              ; con eso obtengo el ID de la tarea actual
+    push ax
+    call sched_disable_task         ; deshabilito la tarea
+    call sched_next_task            ; obtengo una tarea nueva            
+    mov word [task_selector], ax
+    jmp far [task_offtset]         ; con el selector hago un jmp far porque no puedo seguir ejecutando la misma tarea.
+
+fin:
+
+    popad
+    iret
+```
+
+Como voy a trabajar con las tareas, resulta conveniente hacer el codigo en sched.c asì tengo acceso al array sched_tasks. Por lo que ahì definirè las funciones que llamo desde assembly:
+
+```c
+bool matrizSwap[MAX_TASKS][MAX_TASKS] = {0};    // lo inicalizo todo en 0, osea, son todos false.
+
+int8_t obtenerIDTask(void){
+    return current_task;        // uso la variable definida en sched.c
+}
+
+uint8_t swap(int8_t idOrigen, int8_t idDest){
+    if(matrizSwap[idDest][idOrigen] == False){      // entonces no intercambio
+        matrizSwap[idOrigen][idDest] = True;        // Asigno en la matriz que se quiere intercambiar
+        return 0;                                   // retorno 0 porque no se pudo hacer el cambio
+    }
+
+    if(matrizSwap[idDest][idOrigen] == True){       // hay intercambio
+        matrizSwap[idOrigen][idDest] = False;       // voy a hacer el intercambio, entonces
+        matrizSwap[idDest][idOrigen] = False;       // limpio el pedido de la matriz.
+        return 1;                                   // retorno 1 avisando que hago el intercambio.
+    }
+}
+
+int32_t* regsGeneralesTSS(int8_t idDest){
+    int32_t* regsGenerales = malloc(6 * 4);         // 6 espacios, 4 bytes cada uno
+    int16_t selector = sched_tasks[idDest].selector;
+    int16_t index = selector >> 3;
+    tss_t* tssTask = gdt[index].base;
+    regsGenerales[5] = tssTask.eax;
+    regsGenerales[4] = tssTask.ecx;
+    regsGenerales[3] = tssTask.edx;
+    regsGenerales[2] = tssTask.ebx;
+    regsGenerales[1] = tssTask.esi;
+    regsGenerales[0] = tssTask.edi;
+
+    return regsGenerales;
+}
+
+void cambiarEnTSS(int32_t* arrayRegs, int8_t idDest){
+    int16_t selector = sched_tasks[idDest].selector;
+    int16_t index = selector >> 3;
+    tss_t* tssTask = gdt[index].base;
+    tssTask.eax = arrayRegs[5];
+    tssTask.ecx = arrayRegs[4];
+    tssTask.edx = arrayRegs[3];
+    tssTask.ebx = arrayRegs[2];
+    tssTask.esi = arrayRegs[1];
+    tssTask.edi = arrayRegs[0];
+
+    free(arrayRegs);
+
+}
+```
+
+
+b)
+
+Ahora implemento la syscall swap_now, arriba de todo ya definì que usarìa una entrada IDT de nivel 3, y le asignarìa el numero 100:
+El unico cambio con el swap normal serìa que no le harìa un sched_disable_task a la actual en el caso de que no se concrete el swap
+
+```asm
+section .data
+task_offtset: dd 0x00000000
+task_selector: dw 0x0000
+
+global _isr100
+_isr100:              
+    pushad
+    mov word bx, [esp + 32]      ; este es el id al que quiero saltar.
+    call obtenerIDTask           ; con eso obtengo el ID de la tarea actual
+    push bx
+    push ax
+    call swap                    ; chequeo en la matriz si puedo swapear
+    add esp, 4
+
+    cmp ax, 1                    ; swap me dice si puedo swapear, si puedo es 1
+    jl noSwap                    ; si es menor a 1, no puedo, no swapea.
+
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    call sched_enable_task
+    call regsGeneralesTSS        ; con el id consigo todos los registros generales
+                                 ; los cuales me los retorna en un array siendo eax 
+                                 ; la direcciòn inicial de la matriz.
+    add esp, 2
+
+    mov dword edi, [esp]        ; resguardo el valor original de edi de la tarea actual
+    mov dword [esp], [eax]      ; reemplazo el valor de edi de la actual, con el de la otra tarea
+    mov dword [eax], edi        ; a medida que voy reemplazando valores, guardo los actuales en el array
+
+    mov dword esi, [esp + 4]    ; guardo esi
+    mov dword [esp + 4], [eax + 4]
+    mov dword [eax + 4], esi
+
+    mov dword ebx, [esp + 16]    ; guardo ebx
+    mov dword [esp + 16], [eax + 8]
+    mov dword [eax + 8], ebx
+
+    mov dword edx, [esp + 20]    ; guardo edx
+    mov dword [esp + 20], [eax + 12]
+    mov dword [eax + 12], edx
+
+    mov dword ecx, [esp + 24]    ; guardo ecx
+    mov dword [esp + 24], [eax + 16]
+    mov dword [eax + 16], ecx
+
+    mov dword ecx, [esp + 28]           ; guardo eax, acà igual uso como registro intermediario ecx
+    mov dword [esp + 28], [eax + 20]    ; porque si uso eax, pierdo el puntero al array
+    mov dword [eax + 20], ecx
+
+    ; para este punto ya hice todos los cambios en la tarea actual
+    ; y el array que empieza en eax tiene todos los valores actuales,
+    ; se lo puedo mandar a una funciòn en C para que use esos valores
+    ; para cambiarlo en la tss.
+
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    push eax                     ; pusheo el id de la tarea destino y el array con los valores.
+
+    call cambiarEnTSS
+
+    add esp, 6
+
+    ; ya completè todos los cambios, sigue la ejecuciòn de la tarea actual
+
+    jmp fin
+
+
+noSwap: 
+    call sched_next_task            ; obtengo una tarea nueva            
+    mov word [task_selector], ax
+    jmp far [task_offtset]         ; con el selector hago un jmp far porque no puedo seguir ejecutando la misma tarea.
+
+fin:
+
+    popad
+    iret
+```
+
+
+# Ejercicio 2
+
+En el ejercicio 1 ya sabemos distinguir si se realiza un cambio o no, solo hay que entrar en la direcciòn virtual 0xC001C0DE de las dos tareas involucradas y escribir un 1 o un 0 segùn corresponda. Escribir en la virtual de la tarea actual es trivial porque ya estamos con el cr3 de la tarea actual, el problema es escribir en esa direcciòn en la otra tarea.  
+Para solucionarlo guardo el cr3 actual en una variable, luego consigo el cr3 de la otra tarea usando su id para obtenerlo de su TSS, luego uso la funciòn lcr3 definida en el i386.h del tp para cambiar el cr3 por el de la otra tarea, ahora teniendo el otro cr3, puedo acceder a su virtual y le pongo el valor necesario.
+
+```c
+
+#define FLAG_SWAP 0xC001C0DE
+
+void AvisoSwap(int16_t idDest){
+    uint32_t* swapDir = FLAG_SWAP;
+    swapDir[0] = 1;                 //aviso swap en la tarea actual
+
+    int16_t selector = sched_tasks[idDest].selector;
+    int16_t index = selector >> 3;
+    tss_t* tssTask = gdt[index].base;
+    uint32_t cr3Actual = rcr3();
+    uint32_t cr3Alternativo = tssTask.cr3;
+
+    lcr3(cr3Alternativo);
+    swapDir[0] = 1;                 //aviso swap en la otra tarea
+
+    lcr3(cr3Actual);
+
+}
+
+void AvisoNoSwap(int16_t idDest){
+    uint32_t* swapDir = FLAG_SWAP;
+    swapDir[0] = 0;                 //aviso que no hubo swap en la tarea actual
+
+    int16_t selector = sched_tasks[idDest].selector;
+    int16_t index = selector >> 3;
+    tss_t* tssTask = gdt[index].base;
+    uint32_t cr3Actual = rcr3();
+    uint32_t cr3Alternativo = tssTask.cr3;
+
+    lcr3(cr3Alternativo);
+    swapDir[0] = 0;                 //aviso que no hubo swap en la otra tarea
+
+    lcr3(cr3Actual);
+}
+```
+
+Con estas funciones, en ambos swap y swap_now el cambio serìa:
+
+- Para antes del jmp fin, que serìa el caso de AvisoSwap colocarìa:
+
+```asm
+    ;...
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    call AvisoSwap
+    add esp, 2
+
+    jmp fin                      ; el jmp fin que ya està en ambas syscalls.
+    ;...
+```
+
+- Justo luego de la etiqueta noSwap colocarìa 
+
+```asm
+    ;...
+    mov word bx, [esp + 32]      ; consigo devuelta el id de la tarea por la que swapeo
+    push bx
+    call AvisoNoSwap
+    add esp, 2
+
+    call sched_next_task         ; el call de la nueva tarea que està en ambas syscalls
+    ;...
+```
+
+Lo hago asì para no copiar y pegar dos veces la muralla de codigo que son swap y no swap solo para agregarle esto.
